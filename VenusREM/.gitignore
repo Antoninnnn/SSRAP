@@ -180,6 +180,12 @@ data/case
 data/uniprot_taxon
 data/my_proteins
 
+data/proteingym_v1/uniref100.fasta.gz
+data/proteingym_v1/aa_seq.tar.gz
+data/proteingym_v1/struc_seq.tar.gz
+data/proteingym_v1/struc_seq_aln_foldseek.tar.gz
+data/proteingym_v1/struc_seq_aln_foldseek_json.tar.gz
+data/proteingym_v1/struc_seq_aln_foldseek_json.tar.gz
 data/proteingym_v1/aa_seq_aln_a2m.tar.gz
 data/proteingym_v1/aa_seq_aln_a3m.tar.gz
 
