@@ -1,6 +1,5 @@
 
 import torch
-torch.cuda.empty_cache()
 import os
 import json
 import random
@@ -138,13 +137,12 @@ def score_protein(model, tokenizer, residue_fasta, structure_fasta, mutant_df,
     input_ids = tokenized_results["input_ids"].to(device)
     attention_mask = tokenized_results["attention_mask"].to(device)
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            ss_input_ids=ss_input_ids,
-            labels=input_ids,
-        )
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        ss_input_ids=ss_input_ids,
+        labels=input_ids,
+    )
 
     # loss = outputs.loss.item()
     logits = outputs.logits[0]
@@ -300,7 +298,7 @@ if __name__ == "__main__":
     for model_idx, model_name in enumerate(args.model_name):
         print(f">>> Loading model {model_name}...")
         model = AutoModelForMaskedLM.from_pretrained(
-            model_name, trust_remote_code=True, use_safetensors=True
+            model_name, trust_remote_code=True
         )
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -309,7 +307,7 @@ if __name__ == "__main__":
             print(f">>> Scoring {protein_name}, current {idx+1}/{len(protein_names)}...")
             # load data
             residue_fasta = f"{args.aa_seq_dir}/{protein_name}.fasta"
-            structure_fasta = f"{args.struc_seq_dir}/2048/{protein_name}.fasta"
+            structure_fasta = f"{args.struc_seq_dir}/{model_name.split('-')[-1]}/{protein_name}.fasta"
             mutant_file = f"{args.mutant_dir}/{protein_name}.csv"
             if args.logit_mode is not None:
                 if "aa_seq_aln" in args.logit_mode:

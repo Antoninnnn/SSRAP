@@ -1,6 +1,5 @@
 
 import torch
-torch.cuda.empty_cache()
 import os
 import json
 import random
@@ -11,6 +10,10 @@ from Bio import SeqIO
 from scipy.stats import spearmanr
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from argparse import ArgumentParser
+from esm.pretrained import esm_msa1b_t12_100M_UR50S
+
+
+msa_transformer, msa_alphabet = esm_msa1b_t12_100M_UR50S()
 
 amino_acid_properties = {
     'A': {'hydrophobicity': 1.8,  'charge':  0, 'polarity':  0, 'molecular_weight':  89.09, 'volume':  88.6},
@@ -60,6 +63,31 @@ def read_multi_fasta(file_path):
             sequences[header] = current_sequence
     return sequences
 
+def read_multi_fasta_for_esm_msa(file_path):
+    """
+    params:
+        file_path: path to a fasta file
+    return:
+        a dictionary of sequences
+    """
+    sequences = {}
+    current_sequence = ''
+    with open(file_path, 'r') as file:
+        for line in file:
+            line = line.strip()
+            if line.startswith('>'):
+                if current_sequence:
+                    sequences[header] = current_sequence.upper().replace('.', '-')
+                    current_sequence = ''
+                header = line
+            else:
+                current_sequence += line
+        if current_sequence:
+            sequences[header] = current_sequence
+    return sequences
+
+
+
 
 def read_seq(fasta):
     for record in SeqIO.parse(fasta, "fasta"):
@@ -86,6 +114,57 @@ def count_matrix_from_residue_alignment(tokenizer, alignment_dict):
     count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
     # count_matrix = count_matrix * coverage
     return count_matrix, int(aln_start)-1, int(aln_end)
+
+def count_msa_transformer_matrix_from_residue_alignment(alignment_dict):
+
+
+    # Convert the dictionary items to a list of tuples (label, msa_string)
+    msa_batch = list(alignment_dict.items())
+
+    # Optionally, remove the last entry if needed (as in your original code)
+    msa_batch = msa_batch[:-1]
+
+    # Subsample if the MSA depth exceeds the maximum allowed (e.g., 1024 sequences)
+    max_depth = 255
+
+    L=len(msa_batch[0][1])
+
+    # print(msa_batch[0:10])
+
+    # If the number of alignments exceeds max_depth, subsample the list
+    if len(msa_batch) > max_depth:
+        print(f"MSA batch has {len(msa_batch)} alignments; subsampling to {max_depth}")
+        msa_batch_random = random.sample(msa_batch, max_depth)
+        msa_batch =[msa_batch[0]]+ msa_batch_random
+
+    # print(msa_batch)
+
+    # Initialize the batch converter using the msa_alphabet from the pretrained model.
+    msa_batch_converter = msa_alphabet.get_batch_converter()
+
+    # Convert the (subsampled) msa_batch to tokens.
+    msa_labels, msa_strs, msa_tokens = msa_batch_converter(msa_batch)
+
+    try:
+        aln_start, aln_end = msa_labels[0][0].split('/')[-1].split('-')
+    except:
+        aln_start, aln_end = 1, len(msa_strs[0])
+
+
+    return msa_labels, msa_strs, msa_tokens, int(aln_start), int(aln_end), int(L)
+
+
+def alphabet_transform(old, new, mat):
+  # build a mapping from residue -> its index in the old matrix
+  old_idx = {res: i for i, res in enumerate(old)}
+
+  # for each residue in the new order, grab its old index
+  reorder_indices = [old_idx[res] for res in new]
+
+  # apply to your matrix
+  res = mat[:,reorder_indices]
+
+  return res
 
 
 def count_matrix_from_structure_alignment(tokenizer, alignment_dict):
@@ -138,80 +217,143 @@ def score_protein(model, tokenizer, residue_fasta, structure_fasta, mutant_df,
     input_ids = tokenized_results["input_ids"].to(device)
     attention_mask = tokenized_results["attention_mask"].to(device)
 
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            ss_input_ids=ss_input_ids,
-            labels=input_ids,
-        )
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        ss_input_ids=ss_input_ids,
+        labels=input_ids,
+        output_attentions=True,  # Make sure to get attention outputs
+        return_dict=True
+    )
 
     # loss = outputs.loss.item()
     logits = outputs.logits[0]
     logits = torch.log_softmax(logits[1:-1, :], dim=-1)
+
+    # Extract last layer attention
+# Shape of outputs.attentions[-1] is (batch_size, num_heads, seq_len, seq_len)
+    last_attention = outputs.attentions[-1]
+
+    target = list("ACDEFGHIKLMNPQRSTVWY")
+    spec_esmmsa_tok_pos_1 = [1,0,2]
+    spec_esmmsa_tok_pos_2 = [3,-1]
     
     if alpha != 0:
-        if aa_seq_aln_file is not None and struc_seq_aln_file is None:
-            print(">>> Using residue sequence alignment matrix...")
-            alignment_dict = read_multi_fasta(aa_seq_aln_file)
-            alignment_matrix, aln_start, aln_end = count_matrix_from_residue_alignment(tokenizer, alignment_dict)
-            for sample in range(sample_times):
-                if sample_ratio < 1.0:
-                    print(f">>> Sample {sample+1}/{sample_times} with ratio {sample_ratio}")
-                    sample_size = int(len(alignment_matrix) * sample_ratio)
-                    sample_indices = random.sample(range(len(alignment_matrix)), sample_size)
-                    alignment_matrix_sample = alignment_matrix[sample_indices]
-                else:
-                    alignment_matrix_sample = alignment_matrix
-                
-                count_matrix = torch.zeros(alignment_matrix_sample.size(1), tokenizer.vocab_size)
-                for i in tqdm(range(alignment_matrix_sample.size(1))):
-                    count_matrix[i] = torch.bincount(alignment_matrix_sample[:,i], minlength=tokenizer.vocab_size)
-                
-                count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
-                count_matrix = torch.log_softmax(count_matrix, dim=-1)
-                aln_modify_logits = (1-alpha) * logits[aln_start: aln_end, :] + alpha * count_matrix
-                logits = torch.cat([logits[:aln_start], aln_modify_logits, logits[aln_end:]], dim=0)
+        
+    #     if aa_seq_aln_file is not None and struc_seq_aln_file is None:
+    #         # print(">>> Using residue sequence alignment matrix...")
+    #         # alignment_dict = read_multi_fasta(aa_seq_aln_file)
+    #         # alignment_matrix, aln_start, aln_end = count_matrix_from_residue_alignment(tokenizer, alignment_dict)
+    #         # for sample in range(sample_times):
+    #         #     if sample_ratio < 1.0:
+    #         #         print(f">>> Sample {sample+1}/{sample_times} with ratio {sample_ratio}")
+    #         #         sample_size = int(len(alignment_matrix) * sample_ratio)
+    #         #         sample_indices = random.sample(range(len(alignment_matrix)), sample_size)
+    #         #         alignment_matrix_sample = alignment_matrix[sample_indices]
+    #         #     else:
+    #         #         alignment_matrix_sample = alignment_matrix
 
-        if struc_seq_aln_file is not None and aa_seq_aln_file is None:
-            print(">>> Using structure sequence alignment matrix...")
-            alignment_dict = read_multi_fasta(struc_seq_aln_file)
-            alignment_matrix = count_matrix_from_structure_alignment(tokenizer, alignment_dict)
-            if alignment_matrix is not None:
-                count_matrix = torch.zeros(alignment_matrix.size(1), tokenizer.vocab_size)
-                for i in tqdm(range(alignment_matrix.size(1))):
-                    count_matrix[i] = torch.bincount(alignment_matrix[:,i], minlength=tokenizer.vocab_size)
-                count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
-                count_matrix = torch.log_softmax(count_matrix, dim=-1)
-                logits = (1-alpha) * logits + alpha * count_matrix
+    #         print(">>> Using residue sequence alignment matrix...")
+    #         alignment_dict = read_multi_fasta_for_esm_msa(aa_seq_aln_file)
+    #         # alignment_matrix, aln_start, aln_end = count_matrix_from_residue_alignment(tokenizer, alignment_dict)
+    #         _, _, msa_tokens, aln_start, aln_end, L = count_msa_transformer_matrix_from_residue_alignment(alignment_dict)
+            
+    #         print("align start pos:", aln_start, "align end pos:", aln_end)
+    #         for sample in range(sample_times):
+    #             if sample_ratio < 1.0:
+    #                 print(f">>> Sample {sample+1}/{sample_times} with ratio {sample_ratio}")
+    #                 sample_size = int(len(msa_tokens[0]) * sample_ratio)
+    #                 sample_indices = random.sample(range(len(msa_tokens[0])), sample_size)
+    #                 msa_tokens[0] = msa_tokens[0][sample_indices]
                 
-        if aa_seq_aln_file is not None and struc_seq_aln_file is not None:
-            print(">>> Using both residue and structure sequence alignment matrix...")
-            plm_logits = logits.clone()
-            
-            alignment_dict = read_multi_fasta(struc_seq_aln_file)
-            structure_alignment_matrix = count_matrix_from_structure_alignment(tokenizer, alignment_dict)
-            if structure_alignment_matrix is not None:
-                count_matrix = torch.zeros(structure_alignment_matrix.size(1), tokenizer.vocab_size)
-                for i in tqdm(range(structure_alignment_matrix.size(1))):
-                    count_matrix[i] = torch.bincount(structure_alignment_matrix[:,i], minlength=tokenizer.vocab_size)
                 
-                count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
-                count_matrix = torch.log_softmax(count_matrix, dim=-1)
-                logits = (1-alpha) * plm_logits + alpha * count_matrix
+    #             ### TO DO: add attention (from prosst) to the alignment matrix
+
+    #             with torch.no_grad():
+    #                 # Specify the representation layers you want.
+    #                 # Here, we extract representations from layer 12.
+    #                 results = msa_transformer(msa_tokens, repr_layers=[12], return_contacts=False)
+    #                 token_representations = results["representations"][12][0]
+    #                 # token_representations shape: (batch, num_seqs, seq_length, representation_dim)
+    #                 target_tokens = token_representations[0, 1:L+1] 
+
+    #                 # Compute logits for each position
+    #                 logits_msa = msa_transformer.lm_head(target_tokens)  # (L, vocab_size)
+    #                 print("Logits shape:", logits_msa.shape)
+
+    #                 print(f"aln_start: {aln_start} ({type(aln_start)}), aln_end: {aln_end} ({type(aln_end)})")
+                    
+    #                 # Extract scores for amino acids only (skip special tokens)
+    #                 aa_logits = logits_msa[:, 4:24]  # 20 amino acids
+
+                    
+    #                 spec_logits_1 = logits_msa[:, spec_esmmsa_tok_pos_1]
+    #                 spec_logits_2 = logits_msa[:, spec_esmmsa_tok_pos_2]
+
+    #                 # aa_logits = torch.log_softmax(aa_logits, dim=1)   
+                    
+    #                 # Convert to numpy array
+    #                 # mutation_scores = aa_logits.cpu().detach().numpy()
+    #                 # mutation_scores = aa_logits.cpu().detach().numpy()
+
+    #                 mutation_scores_final = alphabet_transform(msa_alphabet.all_toks[4:24],target, aa_logits)
+
+    #             print("mutation_score final dim:", mutation_scores_final.shape)
+
+                
+    #             count_matrix = torch.zeros(L, tokenizer.vocab_size)
+    #             # for i in tqdm(range(alignment_matrix_sample.size(1))):
+    #             #     count_matrix[i] = torch.bincount(alignment_matrix_sample[:,i], minlength=tokenizer.vocab_size)
+                
+    #             # count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
+    #             # count_matrix = torch.log_softmax(count_matrix, dim=-1)
+    #             count_matrix[:,:3] = spec_logits_1
+    #             count_matrix[:,3:23] =mutation_scores_final 
+    #             count_matrix[:,-2:] =spec_logits_2
+    #             count_matrix = torch.log_softmax(count_matrix, dim=1).to(device)
+    #             print("prosst logits shape:", logits[aln_start: aln_end, :].shape, "mutation_score_msa shape:", count_matrix.shape)
+    #             aln_modify_logits = (1-alpha) * logits[aln_start: aln_end, :] + alpha * count_matrix[1:,:]
+    #             logits = torch.cat([logits[:aln_start], aln_modify_logits, logits[aln_end:]], dim=0)
+
+    #     if struc_seq_aln_file is not None and aa_seq_aln_file is None:
+    #         print(">>> Using structure sequence alignment matrix...")
+    #         alignment_dict = read_multi_fasta(struc_seq_aln_file)
+    #         alignment_matrix = count_matrix_from_structure_alignment(tokenizer, alignment_dict)
+    #         if alignment_matrix is not None:
+    #             count_matrix = torch.zeros(alignment_matrix.size(1), tokenizer.vocab_size)
+    #             for i in tqdm(range(alignment_matrix.size(1))):
+    #                 count_matrix[i] = torch.bincount(alignment_matrix[:,i], minlength=tokenizer.vocab_size)
+    #             count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
+    #             count_matrix = torch.log_softmax(count_matrix, dim=-1)
+    #             logits = (1-alpha) * logits + alpha * count_matrix
+                
+    #     if aa_seq_aln_file is not None and struc_seq_aln_file is not None:
+    #         print(">>> Using both residue and structure sequence alignment matrix...")
+    #         plm_logits = logits.clone()
             
-            alignment_dict = read_multi_fasta(aa_seq_aln_file)
-            residue_alignment_matrix, aln_start, aln_end = count_matrix_from_residue_alignment(tokenizer, alignment_dict)
-            count_matrix = torch.zeros(residue_alignment_matrix.size(1), tokenizer.vocab_size)
-            for i in tqdm(range(residue_alignment_matrix.size(1))):
-                count_matrix[i] = torch.bincount(residue_alignment_matrix[:,i], minlength=tokenizer.vocab_size)
+    #         alignment_dict = read_multi_fasta(struc_seq_aln_file)
+    #         structure_alignment_matrix = count_matrix_from_structure_alignment(tokenizer, alignment_dict)
+    #         if structure_alignment_matrix is not None:
+    #             count_matrix = torch.zeros(structure_alignment_matrix.size(1), tokenizer.vocab_size)
+    #             for i in tqdm(range(structure_alignment_matrix.size(1))):
+    #                 count_matrix[i] = torch.bincount(structure_alignment_matrix[:,i], minlength=tokenizer.vocab_size)
+                
+    #             count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
+    #             count_matrix = torch.log_softmax(count_matrix, dim=-1)
+    #             logits = (1-alpha) * plm_logits + alpha * count_matrix
             
-            count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
-            count_matrix = torch.log_softmax(count_matrix, dim=-1)
-            aln_modify_logits = (1-alpha) * logits[aln_start: aln_end, :] + alpha * count_matrix
-            logits = torch.cat([plm_logits[:aln_start], aln_modify_logits, plm_logits[aln_end:]], dim=0)
-    else:
-        print(">>> No alignment matrix used")
+    #         alignment_dict = read_multi_fasta(aa_seq_aln_file)
+    #         residue_alignment_matrix, aln_start, aln_end = count_matrix_from_residue_alignment(tokenizer, alignment_dict)
+    #         count_matrix = torch.zeros(residue_alignment_matrix.size(1), tokenizer.vocab_size)
+    #         for i in tqdm(range(residue_alignment_matrix.size(1))):
+    #             count_matrix[i] = torch.bincount(residue_alignment_matrix[:,i], minlength=tokenizer.vocab_size)
+            
+    #         count_matrix = (count_matrix / count_matrix.sum(dim=1, keepdim=True)).to(device)
+    #         count_matrix = torch.log_softmax(count_matrix, dim=-1)
+    #         aln_modify_logits = (1-alpha) * logits[aln_start: aln_end, :] + alpha * count_matrix
+    #         logits = torch.cat([plm_logits[:aln_start], aln_modify_logits, plm_logits[aln_end:]], dim=0)
+    # else:
+    #     print(">>> No alignment matrix used")
     
     
     mutants = mutant_df["mutant"].tolist()
@@ -300,7 +442,7 @@ if __name__ == "__main__":
     for model_idx, model_name in enumerate(args.model_name):
         print(f">>> Loading model {model_name}...")
         model = AutoModelForMaskedLM.from_pretrained(
-            model_name, trust_remote_code=True, use_safetensors=True
+            model_name, trust_remote_code=True
         )
         model = model.to(device)
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -309,7 +451,7 @@ if __name__ == "__main__":
             print(f">>> Scoring {protein_name}, current {idx+1}/{len(protein_names)}...")
             # load data
             residue_fasta = f"{args.aa_seq_dir}/{protein_name}.fasta"
-            structure_fasta = f"{args.struc_seq_dir}/2048/{protein_name}.fasta"
+            structure_fasta = f"{args.struc_seq_dir}/{model_name.split('-')[-1]}/{protein_name}.fasta"
             mutant_file = f"{args.mutant_dir}/{protein_name}.csv"
             if args.logit_mode is not None:
                 if "aa_seq_aln" in args.logit_mode:
